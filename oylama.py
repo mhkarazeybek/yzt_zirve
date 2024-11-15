@@ -1,11 +1,15 @@
 import cv2
 import numpy as np
-import torch
 from mss import mss
-import random
+from ultralytics import YOLO
+import mediapipe as mp
 
-# YOLOv8 modelini yükleyin (Ultralytics tarafından sağlanmıştır)
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s', device='cpu', force_reload=True)  # CUDA sorunlarını önlemek için CPU kullanılıyor, force_reload ekledik
+# YOLOv8x modelini yükleyin (Ultralytics tarafından sağlanmıştır)
+model = YOLO('yolov8x.pt')  # YOLOv8x (güncel model olarak değiştirilmiştir)
+
+# Mediapipe yüz algılama modülü
+mp_face_detection = mp.solutions.face_detection
+face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.3)
 
 # Ekran görüntüsü almak için mss kullanıyoruz
 sct = mss()
@@ -13,19 +17,12 @@ sct = mss()
 # Ekranda izlenecek alanı tanımlayın (örnek olarak tüm ekran)
 monitor = sct.monitors[1]  # Tüm ekranı kullanmak için
 
-# Duygu analizi ve el tespiti için Google Mediapipe kullanımı
-import mediapipe as mp
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
-mp_hands = mp.solutions.hands
-
-# Mediapipe yüz ağız çözümü ve el çözümü
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=5, refine_landmarks=True)
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
-
 overtime = 0  # Soru gösterim süresi için sayaç
 question_duration = 300  # Belirli bir süre boyunca (örneğin 300 frame) soruyu ekranda tutmak
 vote_count = 0  # Oy verenlerin sayısı
+total_persons_detected = set()  # Toplamda tespit edilen insanların seti
+related_indices = set()  # Ilgili kişiler
+unrelated_indices = set()  # Ilgisiz kişiler
 
 while True:
     try:
@@ -33,128 +30,92 @@ while True:
         screenshot = np.array(sct.grab(monitor))
         frame = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
 
-        # YOLO modelini kullanarak tahmin yap
-        with torch.no_grad():  # Performans sorunlarını ve uyarıları önlemek için no_grad kullanıyoruz
-            results = model(frame)
-
-        # İnsanları tespit etmek için sonuçları filtrele
+        # YOLOv8 modelini kullanarak tahmin yap
+        results = model(frame, conf=0.2, iou=0.5)  # Daha yüksek güven eşiği kullanarak daha tutarlı sonuçlar elde et
+        
         ih, iw, _ = frame.shape  # Frame boyutlarını burada tanımlayın
         person_count = 0
         persons = []
-        for det in results.xyxy[0]:
-            # detection format: [x1, y1, x2, y2, confidence, class]
-            x1, y1, x2, y2, conf, cls = det
-            if int(cls) == 0:  # Sınıf 0 'insan' anlamına gelir
-                person_count += 1
-                persons.append((int(x1), int(y1), int(x2), int(y2)))
+        hands = []
 
-        # Duygu analizi için yüz tespiti
+        # İnsanları ve elleri tespit etmek için sonuçları filtrele
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())  # Tespit edilen kutunun koordinatları
+                cls = int(box.cls[0])  # Sınıf etiketi
+                conf = box.conf[0]  # Güven skoru
+                if conf > 0.3:
+                    if cls == 0:  # İnsan sınıfı
+                        person_count += 1
+                        x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, iw - 1), min(y2, ih - 1)  # Çerçeve sınırlarını görüntü boyutlarıyla sınırlayın
+                        persons.append((x1, y1, x2, y2))
+                        # Tespit edilen kişiyi toplam kişilere ekle
+                        already_detected = False
+                        for person in total_persons_detected:
+                            existing_x1, existing_y1, existing_x2, existing_y2 = person
+                            iou_x1 = max(existing_x1, x1)
+                            iou_y1 = max(existing_y1, y1)
+                            iou_x2 = min(existing_x2, x2)
+                            iou_y2 = min(existing_y2, y2)
+                            iou_width = max(0, iou_x2 - iou_x1)
+                            iou_height = max(0, iou_y2 - iou_y1)
+                            intersection_area = iou_width * iou_height
+                            existing_area = (existing_x2 - existing_x1) * (existing_y2 - existing_y1)
+                            current_area = (x2 - x1) * (y2 - y1)
+                            iou = intersection_area / float(existing_area + current_area - intersection_area)
+                            if iou > 0.05:  # Eğer IoU %5'ten fazlaysa aynı kişi olarak kabul et (daha hassas algılama)
+                                already_detected = True
+                                break
+                        if not already_detected:
+                            total_persons_detected.add((x1, y1, x2, y2))
+                            unrelated_indices.add(len(total_persons_detected) - 1)
+                    elif cls == 15:  # El sınıfı (El tespiti için farklı bir sınıf belirledik, örneğin: 15 (el çantası, el olarak kabul edildi))
+                        hands.append((x1, y1, x2, y2))
+
+        # Mediapipe kullanarak yüz tespiti yap ve kişilerin ilgili olup olmadığını belirle
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        face_results = face_mesh.process(rgb_frame)
-        hands_results = hands.process(rgb_frame)
-        related_indices = set()
-        vote_count = 0
-
-        face_y_coords = []  # Her bir yüz için y koordinatlarını saklamak için liste
-
-        if face_results.multi_face_landmarks:
-            for idx, face_landmarks in enumerate(face_results.multi_face_landmarks):
-                mp_drawing.draw_landmarks(frame, face_landmarks, mp_face_mesh.FACEMESH_TESSELATION)
-                # Yüzün hangi kişiye ait olduğunu belirlemek için yüzün merkezini hesaplayın
-                x_coords = [landmark.x * iw for landmark in face_landmarks.landmark]
-                y_coords = [landmark.y * ih for landmark in face_landmarks.landmark]
-                face_x = int(sum(x_coords) / len(x_coords))
-                face_y = int(sum(y_coords) / len(y_coords))
-                face_y_coords.append(face_y)  # Yüz y koordinatını sakla
-                
-                # Yüzün ilgili olup olmadığını belirtmek için en yakın kişiyle eşleştirin
+        face_results = face_detection.process(rgb_frame)
+        if face_results.detections:
+            for detection in face_results.detections:
+                bboxC = detection.location_data.relative_bounding_box
+                x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), int(bboxC.width * iw), int(bboxC.height * ih)
+                face_center_x = x + w // 2
+                face_center_y = y + h // 2
+                # Yüzün merkezi herhangi bir kişi kutusunun içinde mi kontrol et
                 for i, (x1, y1, x2, y2) in enumerate(persons):
-                    if x1 <= face_x <= x2 and y1 <= face_y <= y2:
-                        # El tespit et ve kişinin oy verip vermediğini kontrol et
-                        if hands_results.multi_hand_landmarks:
-                            for hand_landmarks in hands_results.multi_hand_landmarks:
-                                # El bileği ve parmak uçlarını kontrol et
-                                hand_points = [
-                                    mp_hands.HandLandmark.WRIST,
-                                    mp_hands.HandLandmark.INDEX_FINGER_TIP,
-                                    mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
-                                    mp_hands.HandLandmark.RING_FINGER_TIP,
-                                    mp_hands.HandLandmark.PINKY_TIP
-                                ]
-                                vote_detected = False
-                                wrist_x = int(hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].x * iw)
-                                wrist_y = int(hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].y * ih)
-                                # Elin yüz hizasından yukarıda olup olmadığını kontrol et
-                                if wrist_y < face_y - (0.2 * (y2 - y1)):  # Yüz hizasından belirgin yukarıda olduğunda oy kullanılmış kabul edilecek
-                                    vote_detected = True
-                                if vote_detected and i not in related_indices:
-                                    # El kişinin kutusu içerisindeyse ve yüz hizasından yukarıdaysa oy verilmiş olarak kabul et
-                                    # Elin üzerine yeşil bir nokta ekle
-                                    for point in hand_points:
-                                        hand_x = int(hand_landmarks.landmark[point].x * iw)
-                                        hand_y = int(hand_landmarks.landmark[point].y * ih)
-                                        cv2.circle(frame, (hand_x, hand_y), 5, (0, 255, 0), -1)
-                                    cv2.rectangle(frame, (x1, y1, x2, y2), (0, 255, 0), 2)
-                                    # Oy verenlerin boxlarının üzerinde yeşil nokta ekle
-                                    cv2.circle(frame, (x1 + 10, y1 + 10), 5, (0, 255, 0), -1)  # Ilgili - Yesil çerçeve
-                                    related_indices.add(i)
-                                    vote_count += 1  # Oylama olarak kabul edilen her ilgili kişi
-                                    break
-                        else:
-                            # Eğer el tespit edilmediyse normal olarak işaretle
-                            cv2.rectangle(frame, (x1, y1, x2, y2), (0, 255, 0), 2)
-                        break
+                    if x1 <= face_center_x <= x2 and y1 <= face_center_y <= y2:
+                        if i not in related_indices:
+                            related_indices.add(i)
+                            if i in unrelated_indices:
+                                unrelated_indices.remove(i)
 
-        # Tespit edilen tüm insanlar (ilgili ve ilgisiz) için oy kullanma tespiti
-        if hands_results.multi_hand_landmarks:
-            for i, (x1, y1, x2, y2) in enumerate(persons):
-                if i not in related_indices:  # İlgili olarak işaretlenmemiş olanlar için oy tespiti
-                    for hand_landmarks in hands_results.multi_hand_landmarks:
-                        # El bileği ve parmak uçlarını kontrol et
-                        hand_points = [
-                            mp_hands.HandLandmark.WRIST,
-                            mp_hands.HandLandmark.INDEX_FINGER_TIP,
-                            mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
-                            mp_hands.HandLandmark.RING_FINGER_TIP,
-                            mp_hands.HandLandmark.PINKY_TIP
-                        ]
-                        vote_detected = False
-                        wrist_x = int(hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].x * iw)
-                        wrist_y = int(hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].y * ih)
-                        # Yüz y koordinatını al
-                        face_y = face_y_coords[i] if i < len(face_y_coords) else y2  # Eğer yüz bulunamadıysa yüz hizası olarak kişinin alt sınırını kabul et
-                        # Elin kutu içinde olup olmadığını ve yüz hizasından yukarıda olup olmadığını kontrol et
-                        if x1 <= wrist_x <= x2 and wrist_y < face_y - (0.2 * (y2 - y1)):
-                            vote_detected = True
-                        if vote_detected:
-                            # El kişinin kutusu içerisindeyse ve yüz hizasından yukarıdaysa oy verilmiş olarak kabul et
-                            # Elin üzerine yeşil bir nokta ekle
-                            for point in hand_points:
-                                hand_x = int(hand_landmarks.landmark[point].x * iw)
-                                hand_y = int(hand_landmarks.landmark[point].y * ih)
-                                cv2.circle(frame, (hand_x, hand_y), 5, (0, 255, 0), -1)
-                            cv2.rectangle(frame, (x1, y1, x2, y2), (0, 0, 255), 2)  # Ilgisiz ama oy veren - Kırmızı çerçeve
-                            cv2.circle(frame, (x1 + 10, y1 + 10), 5, (0, 255, 0), -1)  # Oy veren - Yesil nokta
-                            vote_count += 1  # Oylama olarak kabul edilen kişi
-                            break
-        
-        # Tespit edilen diğer insanların çerçevesini kırmızı olarak çiz
-        unrelated_count = 0
+        # El tespiti yap ve oy verenleri belirle
+        for hand in hands:
+            hand_x1, hand_y1, hand_x2, hand_y2 = hand
+            vote_detected = True
+            if vote_detected:
+                vote_count += 1
+                # Elin üzerine yeşil bir nokta ekle
+                cx, cy = (hand_x1 + hand_x2) // 2, (hand_y1 + hand_y2) // 2
+                cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+
+        # Ilgili ve ilgisiz kişileri belirlemek için işaretleme yap
         for i, (x1, y1, x2, y2) in enumerate(persons):
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             if i in related_indices:
-                continue  # İlgili olanlar zaten çizildi
-            else:
-                cv2.rectangle(frame, (x1, y1, x2, y2), (0, 0, 255), 2)  # Ilgisiz - Kırmızı çerçeve
-                unrelated_count += 1
+                cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)  # Ilgili - Yeşil nokta
+            elif i in unrelated_indices:
+                cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)  # Ilgisiz - Kırmızı nokta
+
+        # Ekranda insan sayısını, ilgili/ilgisiz ve oy verenlerin sayısını göster
+        cv2.putText(frame, f'Anlik Insan Sayisi: {person_count}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.putText(frame, f'Toplam Insan Sayisi: {len(total_persons_detected)}', (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
-        # Ekranda insan sayısını ve ilgili/ilgisiz sayısını göster
-        related_count = len(related_indices)
-        cv2.putText(frame, f'Insan Sayisi: {person_count}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        cv2.putText(frame, f'Ilgili: {related_count}  Ilgisiz: {unrelated_count}', (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         cv2.putText(frame, f'Oy Verenler: {vote_count}', (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
 
         # Sonucu göster
-        cv2.imshow('Konferans Salonu - Insan Sayma ve Ilgi Analizi', frame)
+        resized_frame = cv2.resize(frame, (960, 540))
+        cv2.imshow('Konferans Salonu - Insan Sayma ve Ilgi Analizi', resized_frame)
 
         # 'q' tuşuna basarak çıkış yap
         if cv2.waitKey(1) & 0xFF == ord('q'):
